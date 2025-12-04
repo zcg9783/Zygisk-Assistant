@@ -1,5 +1,26 @@
 name: CI
-on: [push]
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+        - both
+        - release
+        - debug
+      create_release:
+        description: 'Create GitHub Release (only for tags)'
+        required: false
+        default: false
+        type: boolean
+
 permissions:
   contents: write
 
@@ -21,30 +42,75 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      - name: Determine Build Task
+        id: build_task
+        run: |
+          BUILD_TASK=""
+          case "${{ github.event.inputs.build_type || 'both' }}" in
+            "both")
+              BUILD_TASK="moduleZipRelease moduleZipDebug"
+              ;;
+            "release")
+              BUILD_TASK="moduleZipRelease"
+              ;;
+            "debug")
+              BUILD_TASK="moduleZipDebug"
+              ;;
+            *)
+              BUILD_TASK="moduleZipRelease moduleZipDebug"
+              ;;
+          esac
+          echo "BUILD_TASK=${BUILD_TASK}" >> $GITHUB_OUTPUT
+          echo "Selected build task: ${BUILD_TASK}"
+
       - name: Build with Gradle
-        run: ./gradlew moduleZipRelease moduleZipDebug
+        run: ./gradlew ${{ steps.build_task.outputs.BUILD_TASK }}
 
       - name: Set CI Variables
         if: success()
         id: prepareArtifact
         run: |
-          echo "releaseName=$(basename module/build/outputs/zip/*-release.zip .zip)" >> $GITHUB_OUTPUT
-          echo "debugName=$(basename module/build/outputs/zip/*-debug.zip .zip)" >> $GITHUB_OUTPUT
+          # For release builds
+          if [[ -f module/build/outputs/zip/*-release.zip ]]; then
+            RELEASE_NAME=$(basename module/build/outputs/zip/*-release.zip .zip)
+            echo "releaseName=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+            echo "hasRelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "hasRelease=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # For debug builds
+          if [[ -f module/build/outputs/zip/*-debug.zip ]]; then
+            DEBUG_NAME=$(basename module/build/outputs/zip/*-debug.zip .zip)
+            echo "debugName=${DEBUG_NAME}" >> $GITHUB_OUTPUT
+            echo "hasDebug=true" >> $GITHUB_OUTPUT
+          else
+            echo "hasDebug=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload Release Artifact
+        if: steps.prepareArtifact.outputs.hasRelease == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.prepareArtifact.outputs.releaseName }}
           path: "module/build/outputs/zip/release"
 
       - name: Upload Debug Artifact
+        if: steps.prepareArtifact.outputs.hasDebug == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.prepareArtifact.outputs.debugName }}
           path: "module/build/outputs/zip/debug"
 
-      - name: Create a release
+      - name: Create a release (auto for tags)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: module/build/outputs/zip/*.zip
+
+      - name: Create a release (manual)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == true && startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: module/build/outputs/zip/*.zip
+          tag_name: ${{ github.ref_name }}

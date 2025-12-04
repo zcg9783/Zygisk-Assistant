@@ -1,6 +1,10 @@
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <sstream>
 
 #include <cstdint>
 #include <functional>
@@ -79,6 +83,68 @@ static bool new_mount_ns()
     return true;
 }
 
+/*
+ * [Helper function to read denylist from file]
+ * Reads package names from /system/etc/denylist.txt
+ * File format: one package name per line, comments start with #
+ */
+static bool isPackageInDenylist(const char* packageName)
+{
+    if (!packageName) {
+        return false;
+    }
+    
+    std::ifstream file("/system/etc/denylist.txt");
+    if (!file.is_open()) {
+        LOGD("denylist.txt not found or cannot be opened");
+        return false;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        // Remove leading/trailing whitespace
+        line.erase(0, line.find_first_not_of(" \t"));
+        line.erase(line.find_last_not_of(" \t") + 1);
+        
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        
+        // Compare package name
+        if (line == packageName) {
+            LOGD("Package %s found in denylist", packageName);
+            file.close();
+            return true;
+        }
+    }
+    
+    file.close();
+    return false;
+}
+
+/*
+ * [Helper function to extract package name from app_data_dir]
+ * Extracts package name from app_data_dir path like /data/user/0/com.example.app
+ */
+static std::string extractPackageName(const char* app_data_dir)
+{
+    if (!app_data_dir) {
+        return "";
+    }
+    
+    std::string path(app_data_dir);
+    
+    // Find the last slash
+    size_t lastSlash = path.find_last_of('/');
+    if (lastSlash == std::string::npos) {
+        return "";
+    }
+    
+    // Extract package name (everything after last slash)
+    return path.substr(lastSlash + 1);
+}
+
 class ZygiskModule : public zygisk::ModuleBase
 {
 public:
@@ -94,14 +160,28 @@ public:
 
         uint32_t flags = api->getFlags();
         bool isRoot = (flags & zygisk::StateFlag::PROCESS_GRANTED_ROOT) != 0;
-        bool isOnDenylist = (flags & zygisk::StateFlag::PROCESS_ON_DENYLIST) != 0;
         bool isChildZygote = args->is_child_zygote != NULL && *args->is_child_zygote;
-        if (isRoot || !isOnDenylist || !Utils::isUserAppUID(args->uid))
+        
+        // Extract package name from app_data_dir
+        std::string packageName = extractPackageName(args->app_data_dir);
+        bool isPackageDenied = false;
+        
+        if (!packageName.empty()) {
+            isPackageDenied = isPackageInDenylist(packageName.c_str());
+        } else {
+            LOGD("Cannot extract package name from app_data_dir: %s", args->app_data_dir);
+        }
+        
+        // Skip if: root process, package not in denylist, or not a user app
+        if (isRoot || !isPackageDenied || !Utils::isUserAppUID(args->uid))
         {
-            LOGD("Skipping ppid=%d uid=%d isChildZygote=%d", getppid(), args->uid, isChildZygote);
+            LOGD("Skipping ppid=%d uid=%d package=%s isChildZygote=%d", 
+                 getppid(), args->uid, packageName.c_str(), isChildZygote);
             return;
         }
-        LOGD("Processing ppid=%d uid=%d isChildZygote=%d", getppid(), args->uid, isChildZygote);
+        
+        LOGD("Processing ppid=%d uid=%d package=%s isChildZygote=%d", 
+             getppid(), args->uid, packageName.c_str(), isChildZygote);
 
         ASSERT_DO(preAppSpecialize, hookPLTByName("libandroid_runtime.so", "unshare", new_unshare, &old_unshare), return);
         ASSERT_DO(preAppSpecialize, hookPLTByName("libandroid_runtime.so", "setresuid", new_setresuid, &old_setresuid), return);
